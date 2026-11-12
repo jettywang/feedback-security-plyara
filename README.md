@@ -136,6 +136,21 @@ JSON Output:
 
 # Additional Information
 
+## Batch Diagnostic Mode
+
+By default, `parse_string` is strict: the first syntax error raises an exception and nothing is returned. When a large ruleset has a malformed rule in the middle, batch diagnostic mode can be enabled explicitly to return the error locations together with the rules that can still be reviewed:
+
+``` python
+>>> import plyara
+>>> parser = plyara.Plyara()
+>>> result = parser.parse_string_with_diagnostics(input_string)
+>>> result['rules']                   # rules that parsed cleanly, with original line numbers
+>>> result['diagnostics']             # one entry per skipped range
+>>> result['dependencies_complete']   # False when skipped ranges may hide imports or includes
+```
+
+Batch diagnostic mode scans the input for confirmable rule boundaries, ignoring `rule` keywords and braces inside comments and strings, and parses each rule in isolation. Malformed rules, such as those with a broken regex or an unclosed string, are skipped and reported. Each diagnostic carries the error message, the line where the problem was detected, the skipped line range, the rule name if known, and whether parsing recovered afterwards. Rules after an unconfirmable boundary, such as an unclosed rule body, are not recovered; the skipped range is reported instead. Rules whose condition references a skipped rule are marked with `'dependencies_incomplete': True`. Each call is self-contained, so no state carries over to subsequent batch or strict parses.
+
 ## Reusing The Parser
 
 If you want to reuse a single instance of the parser object for efficiency when parsing large quantities of rule or rulesets, the new clear() method must be used.

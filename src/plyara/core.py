@@ -27,7 +27,7 @@ import string
 import ply.lex as lex
 import ply.yacc as yacc
 
-from plyara.exceptions import ParseTypeError, ParseValueError
+from plyara.exceptions import ParseError, ParseTypeError, ParseValueError
 
 # Initialize the logger
 logger = logging.getLogger(__name__)
@@ -55,6 +55,180 @@ class StringTypes(enum.Enum):
     TEXT = 1
     BYTE = 2
     REGEX = 3
+
+
+# Scanner states used by the batch diagnostic mode to confirm rule boundaries
+_SCAN_NORMAL = 0
+_SCAN_LINE_COMMENT = 1
+_SCAN_BLOCK_COMMENT = 2
+_SCAN_TEXT_STRING = 3
+_SCAN_REGEX_STRING = 4
+
+_SCAN_IDENTIFIER_START = set(string.ascii_letters) | {'_'}
+_SCAN_IDENTIFIER_CHARS = _SCAN_IDENTIFIER_START | set(string.digits)
+_SCAN_SCOPE_KEYWORDS = frozenset({'private', 'global'})
+_SCAN_WHITESPACE = ' \t\r\n'
+
+
+def _scan_line_number(text, position):
+    """Return the 1-based line number for a position in the input text."""
+    return text.count('\n', 0, position) + 1
+
+
+def _scan_rule_header_start(text, position):
+    """Extend the position of a rule keyword backwards over any scope keywords."""
+    start = position
+    while start > 0:
+        index = start
+        while index > 0 and text[index - 1] in _SCAN_WHITESPACE:
+            index -= 1
+        end = index
+        while index > 0 and text[index - 1] in _SCAN_IDENTIFIER_CHARS:
+            index -= 1
+        if text[index:end] in _SCAN_SCOPE_KEYWORDS:
+            start = index
+        else:
+            break
+    return start
+
+
+def _scan_rule_name(text):
+    """Extract the rule name from the beginning of a rule header, if present."""
+    match = re.match(r'(?:(?:private|global)\s+)*rule\s+([a-zA-Z_][a-zA-Z_0-9]*)', text)
+    return match.group(1) if match else None
+
+
+def _scan_trailing_comment(text, position):
+    """Extend a rule end position over a trailing comment, matching strict parser behavior."""
+    length = len(text)
+    index = position
+    while index < length and text[index] in _SCAN_WHITESPACE:
+        index += 1
+    if text[index:index + 2] == '//':
+        newline = text.find('\n', index)
+        return length if newline == -1 else newline
+    if text[index:index + 2] == '/*':
+        close = text.find('*/', index + 2)
+        if close != -1:
+            return close + 2
+    return position
+
+
+def _scan_yara_segments(text):
+    """Split YARA input into confirmable segments for batch diagnostic parsing.
+
+    The scanner tracks comments, text strings, and regex strings so that rule keywords and braces
+    inside them are not mistaken for rule boundaries. A rule boundary is only confirmable when its
+    body braces balance; anything at or after an unconfirmable boundary is reported as a skipped
+    segment instead of being recovered.
+
+    Args:
+        text: String input expected to consist of YARA rules.
+
+    Returns:
+        list: Segment dictionaries with keys 'kind' ('toplevel', 'rule', or 'skipped'), 'start',
+        and 'end'. Skipped segments also carry 'reason' and 'terminal' keys.
+    """
+    segments = list()
+    state = _SCAN_NORMAL
+    depth = 0
+    index = 0
+    length = len(text)
+    cursor = 0
+    rule_start = None
+    fatal = None
+
+    while index < length:
+        char = text[index]
+
+        if state == _SCAN_NORMAL:
+            if char == '/' and text[index + 1:index + 2] == '/':
+                state = _SCAN_LINE_COMMENT
+                index += 2
+            elif char == '/' and text[index + 1:index + 2] == '*':
+                state = _SCAN_BLOCK_COMMENT
+                index += 2
+            elif char == '"':
+                state = _SCAN_TEXT_STRING
+                index += 1
+            elif char == '/':
+                state = _SCAN_REGEX_STRING
+                index += 1
+            elif char == '{':
+                depth += 1
+                index += 1
+            elif char == '}':
+                depth -= 1
+                if depth < 0:
+                    fatal = index
+                    break
+                if depth == 0 and rule_start is not None:
+                    rule_end = _scan_trailing_comment(text, index + 1)
+                    if rule_start > cursor:
+                        segments.append({'kind': 'toplevel', 'start': cursor, 'end': rule_start})
+                    segments.append({'kind': 'rule', 'start': rule_start, 'end': rule_end})
+                    cursor = rule_end
+                    rule_start = None
+                index += 1
+            elif char in _SCAN_IDENTIFIER_START and depth == 0:
+                end = index + 1
+                while end < length and text[end] in _SCAN_IDENTIFIER_CHARS:
+                    end += 1
+                if text[index:end] == 'rule':
+                    if rule_start is not None:
+                        if rule_start > cursor:
+                            segments.append({'kind': 'toplevel', 'start': cursor, 'end': rule_start})
+                        segments.append({
+                            'kind': 'skipped',
+                            'start': rule_start,
+                            'end': index,
+                            'reason': 'Rule header is not followed by a rule body',
+                            'terminal': False,
+                        })
+                        cursor = index
+                    rule_start = _scan_rule_header_start(text, index)
+                index = end
+            else:
+                index += 1
+        elif state == _SCAN_LINE_COMMENT:
+            if char == '\n':
+                state = _SCAN_NORMAL
+            index += 1
+        elif state == _SCAN_BLOCK_COMMENT:
+            if char == '*' and text[index + 1:index + 2] == '/':
+                state = _SCAN_NORMAL
+                index += 2
+            else:
+                index += 1
+        else:
+            closer = '"' if state == _SCAN_TEXT_STRING else '/'
+            if char == '\\':
+                index += 2
+            elif char == closer:
+                state = _SCAN_NORMAL
+                index += 1
+            elif char == '\n':
+                # Unterminated string or regex: YARA does not allow these to span lines, so
+                # recovering at the newline keeps brace tracking reliable.
+                state = _SCAN_NORMAL
+                index += 1
+            else:
+                index += 1
+
+    if rule_start is not None or fatal is not None:
+        if fatal is not None:
+            start = min(rule_start, fatal) if rule_start is not None else fatal
+            reason = 'Unbalanced closing brace'
+        else:
+            start = rule_start
+            reason = 'Rule body is not closed' if depth > 0 else 'Rule header is not followed by a rule body'
+        if start > cursor:
+            segments.append({'kind': 'toplevel', 'start': cursor, 'end': start})
+        segments.append({'kind': 'skipped', 'start': start, 'end': length, 'reason': reason, 'terminal': True})
+    elif cursor < length:
+        segments.append({'kind': 'toplevel', 'start': cursor, 'end': length})
+
+    return segments
 
 
 class Parser:
@@ -352,6 +526,114 @@ class Parser:
                 rule['includes'] = self.includes
 
         return self.rules
+
+    def parse_string_with_diagnostics(self, input_string):
+        """Parse YARA rules in batch diagnostic mode, recovering from malformed rules when possible.
+
+        Unlike parse_string, which raises on the first syntax error, this explicitly enabled mode
+        scans the input for confirmable rule boundaries, parses each rule in isolation, and
+        continues past malformed rules so that the rest of the file can still be reviewed. A rule
+        is only recovered when its boundary can be confirmed; anything at or after an
+        unconfirmable boundary, such as an unclosed rule body, is reported as a skipped range.
+
+        This method does not mutate the parser instance state, so consecutive calls on the same
+        parser, as well as subsequent strict parses, are not affected by residual state.
+
+        Line endings are normalized to '\\n' before parsing, so all reported line numbers are
+        1-based visual line numbers, unlike the strict parser which counts '\\r\\n' as two lines.
+
+        Args:
+            input_string: String input expected to consist of YARA rules.
+
+        Returns:
+            dict: A dictionary with three keys:
+
+                - 'rules': Rule dictionaries as produced by parse_string, with line numbers
+                  adjusted to the original input. Rules whose condition references a skipped
+                  rule are marked with 'dependencies_incomplete'.
+                - 'diagnostics': One dictionary per skipped range with the keys 'message',
+                  'line', 'skipped_start_line', 'skipped_end_line', 'rule_name', and
+                  'recovered'.
+                - 'dependencies_complete': False when any input was skipped, because file-scoped
+                  imports and includes may be incomplete.
+        """
+        rules = list()
+        diagnostics = list()
+        imports = set()
+        includes = list()
+
+        input_string = input_string.replace('\r\n', '\n')
+
+        for segment in _scan_yara_segments(input_string):
+            segment_text = input_string[segment['start']:segment['end']]
+            start_line = _scan_line_number(input_string, segment['start'])
+            end_line = _scan_line_number(input_string, segment['end'] - 1)
+
+            if segment['kind'] == 'skipped':
+                diagnostics.append({
+                    'message': segment['reason'],
+                    'line': start_line,
+                    'skipped_start_line': start_line,
+                    'skipped_end_line': end_line,
+                    'rule_name': _scan_rule_name(segment_text),
+                    'recovered': not segment['terminal'],
+                })
+                if segment['terminal']:
+                    break
+                continue
+
+            if segment['kind'] == 'toplevel' and not segment_text.strip():
+                continue
+
+            subparser = type(self)(
+                store_raw_sections=self.store_raw_sections,
+                meta_as_kv=self.meta_as_kv,
+                import_effects=self.import_effects,
+            )
+
+            try:
+                parsed = subparser.parse_string(segment_text)
+            except ParseError as e:
+                error_line = e.lineno if isinstance(e.lineno, int) else 1
+                diagnostics.append({
+                    'message': str(e),
+                    'line': start_line + error_line - 1,
+                    'skipped_start_line': start_line,
+                    'skipped_end_line': end_line,
+                    'rule_name': _scan_rule_name(segment_text) if segment['kind'] == 'rule' else None,
+                    'recovered': True,
+                })
+                continue
+
+            if segment['kind'] == 'toplevel':
+                imports.update(subparser.imports)
+                includes.extend(subparser.includes)
+            else:
+                for rule in parsed:
+                    rule['start_line'] += start_line - 1
+                    rule['stop_line'] += start_line - 1
+                rules.extend(parsed)
+
+        for rule in rules:
+            if any(imports):
+                if self.import_effects:
+                    rule['imports'] = list(imports)
+                elif used_imports := self._find_imports_in_condition(imports, rule['condition_terms']):
+                    rule['imports'] = used_imports
+            if any(includes):
+                rule['includes'] = includes
+
+        skipped_names = {diagnostic['rule_name'] for diagnostic in diagnostics if diagnostic['rule_name']}
+        if skipped_names:
+            for rule in rules:
+                if skipped_names.intersection(rule.get('condition_terms', list())):
+                    rule['dependencies_incomplete'] = True
+
+        return {
+            'rules': rules,
+            'diagnostics': diagnostics,
+            'dependencies_complete': not diagnostics,
+        }
 
 
 class Plyara(Parser):
