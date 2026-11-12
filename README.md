@@ -151,6 +151,22 @@ for file in files:
     parser.clear()
 ```
 
+## Previewing Includes Within An Allowed Root
+
+For callers that need to preview the include graph of a ruleset (for example, a rule review service), `preview_rules()` provides a controlled parsing entry point. The caller supplies an allowed root directory and a starting file; only files resolving inside that root are ever opened. Includes escaping the root directly or via symlinks, cycles, and missing files are reported as issues carrying the include reference chain. `import` statements are preserved as declarations only.
+
+``` python
+import plyara
+
+preview = plyara.preview_rules('/srv/rules', 'main.yar')
+
+for rule in preview.rules:
+    print(rule['rule_name'], 'from', rule['source_file'])
+
+for issue in preview.issues:
+    print(issue.kind.value, issue.include, 'chain:', ' -> '.join(issue.chain))
+```
+
 ## Breaking Change: Import Effects
 
 ### Background
