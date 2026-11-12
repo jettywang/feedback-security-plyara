@@ -18,11 +18,10 @@ rule Set001_Rule002
         $b
 }
 
-/*
-// Although they match identical content as the above two rules,
-// the following four rules do not yet return the same hash.
+// The following two any-of forms use equivalent string sets.
+// The commented all-of rules remain distinct because any and all have different condition logic.
 
-rule Set001_Rule003
+rule Set003_Rule001
 {
     strings:
         $aaa = "foobar"
@@ -31,7 +30,7 @@ rule Set001_Rule003
         any of ($*)
 }
 
-rule Set001_Rule004
+rule Set003_Rule002
 {
     strings:
         $ = "foobar"
@@ -40,7 +39,8 @@ rule Set001_Rule004
         any of them
 }
 
-rule Set001_Rule005
+/*
+rule Set003_Rule003
 {
     strings:
         $ = "foobar"
@@ -49,7 +49,7 @@ rule Set001_Rule005
         all of ($*)
 }
 
-rule Set001_Rule006
+rule Set003_Rule004
 {
     strings:
         $ = "foobar"
@@ -57,7 +57,6 @@ rule Set001_Rule006
     condition:
             all of them
 }
-
 */
 
 rule Set002_Rule001

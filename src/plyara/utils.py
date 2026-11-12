@@ -183,126 +183,316 @@ def detect_dependencies(rule):
     return dependencies
 
 
-def generate_hash(rule, legacy=False):
-    """Calculate a secure hash of the logic in the rule strings and condition.
+_HASH_ALGORITHM = 'sha256'
+_HASH_VERSION = 'v2'
+_LEGACY_HASH_VERSION = 'v1'
+_REFERENCE_TYPES = {
+    '$': 'STRINGVALUE',
+    '#': 'COUNTOFSTRING',
+    '@': 'POSITIONOFSTRING',
+    '!': 'LENGTHOFSTRING',
+}
 
-    If the resultant hashes are identical for two YARA rules, the rules will match on identical content.
-    The reverse it not true, so two rules that match the same content may not generate the same hash.
-    For example, if a rule only contains one string, the logic for 'any of' and 'all of' generate different hashes,
-    but the rules contain the same logic.
 
-    Args:
-        rule: Dict output from a parsed rule.
-        legacy: Enables legacy mode with no versioning or algo name.
+def _hash_condition(condition_mapping, version=None):
+    digest = hashlib.sha256(''.join(condition_mapping).encode()).hexdigest()
 
-    Returns:
-        str: hexdigest
-    """
-    version = 'v1'
+    if version is None:
+        return digest
 
-    hf = hashlib.sha256()
-    algo = 'sha256'
+    return '{}_{}_{}'.format(version, _HASH_ALGORITHM, digest)
 
-    condition_string_prefaces = ('$', '!', '#', '@')
-    strings = rule.get('strings', list())
-    conditions = rule['condition_terms']
 
-    string_values = list()
-    condition_mapping = list()
+def _canonical_string_value(entry):
+    entry_type = entry['type']
+    value = entry['value']
+
+    if entry_type == 'byte':
+        value = re.sub(r'/\*.*?\*/', '', value, flags=re.DOTALL)
+        value = re.sub(r'//.*', '', value)
+        value = re.sub(r'\s+', '', value)
+
+    canonical_value = '{}:{}'.format(entry_type, value)
+    modifiers = sorted(entry.get('modifiers', list()))
+
+    if modifiers:
+        canonical_value += '<MODIFIED>{}'.format(' & '.join(modifiers))
+
+    return canonical_value
+
+
+def _wildcard_pattern(identifier):
+    pattern = [re.escape('$')]
+
+    for character in identifier:
+        if character == '*':
+            pattern.append('.*')
+        else:
+            pattern.append(re.escape(character))
+
+    return re.compile(''.join(pattern))
+
+
+def _reference_values(reference, string_mapping, conditions):
+    symbol = reference[0]
+    identifier = reference[1:]
+    named_strings = string_mapping['named']
+
+    if identifier == '*':
+        values = list(named_strings.values())
+        values.extend(string_mapping['anonymous'])
+    elif identifier.endswith('*'):
+        pattern = _wildcard_pattern(identifier)
+        values = [value for name, value in named_strings.items() if pattern.match(name)]
+    else:
+        name = '${}'.format(identifier)
+
+        if name in named_strings:
+            return named_strings[name]
+
+        logger.error(f'Unhandled String Condition "{reference}" in "{" ".join(conditions)}"')
+        return reference
+
+    return ' | '.join(sorted(values))
+
+
+def _canonical_reference(reference, string_mapping, conditions):
+    if reference in ('#', '@', '!', '$') or reference[:1] not in _REFERENCE_TYPES or reference == '!=':
+        return reference
+
+    reference_type = _REFERENCE_TYPES[reference[0]]
+    return '<{}>{}'.format(
+        reference_type,
+        _reference_values(reference, string_mapping, conditions)
+    )
+
+
+def _is_string_reference(term):
+    return term not in ('#', '@', '!', '$') and term != '!=' and term[:1] in _REFERENCE_TYPES
+
+
+def _canonical_string_set(terms, string_mapping, conditions):
+    members = [
+        _canonical_reference(term, string_mapping, conditions)
+        for term in terms
+        if term != ','
+    ]
+    return ['('] + sorted(members) + [')']
+
+
+def _canonical_condition_terms(rule, string_mapping):
+    conditions = list(rule['condition_terms'])
+    canonical_terms = list()
+    index = 0
+
+    position = 0
+    while position < len(conditions) - 1:
+        if conditions[position] == '#' and conditions[position + 1] == '*':
+            conditions[position:position + 2] = ['#*']
+        position += 1
+
+    while index < len(conditions):
+        term = conditions[index]
+
+        if term == 'them':
+            values = sorted(string_mapping['named'].values())
+            values.extend(string_mapping['anonymous'])
+            canonical_terms.extend(['(', '<STRINGVALUE>{}'.format(' | '.join(sorted(values))), ')'])
+            index += 1
+        elif _is_string_reference(term) and term.endswith('*'):
+            reference = _canonical_reference(term, string_mapping, conditions)
+            if canonical_terms and canonical_terms[-1] == 'of':
+                canonical_terms.extend(['(', reference, ')'])
+            else:
+                canonical_terms.append(reference)
+            index += 1
+        elif term == '(':
+            end_index = index + 1
+            depth = 1
+
+            while end_index < len(conditions):
+                if conditions[end_index] == '(':
+                    depth += 1
+                elif conditions[end_index] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                end_index += 1
+
+            set_terms = [
+                member for member in conditions[index + 1:end_index]
+                if member not in ('(', ')')
+            ]
+
+            if end_index < len(conditions) and set_terms and all(
+                member == ',' or _is_string_reference(member) for member in set_terms
+            ):
+                canonical_terms.extend(_canonical_string_set(set_terms, string_mapping, conditions))
+                index = end_index + 1
+            else:
+                canonical_terms.append(term)
+                index += 1
+        elif _is_string_reference(term):
+            canonical_terms.append(_canonical_reference(term, string_mapping, conditions))
+            index += 1
+        else:
+            canonical_terms.append(term)
+            index += 1
+
+    return canonical_terms
+
+
+def _build_string_mapping(rule):
     string_mapping = {'anonymous': list(), 'named': dict()}
 
-    for entry in strings:
-        name = entry['name']
-        modifiers = entry.get('modifiers', list())
+    for entry in rule.get('strings', list()):
+        value = _canonical_string_value(entry)
 
+        if entry['name'] == '$':
+            string_mapping['anonymous'].append(value)
+        else:
+            string_mapping['named'][entry['name']] = value
+
+    return string_mapping
+
+
+def _legacy_string_mapping(rule):
+    string_mapping = {'anonymous': list(), 'named': dict()}
+
+    for entry in rule.get('strings', list()):
         if entry['type'] == 'byte':
             value = re.sub(r'[^-a-fA-F?0-9\[\]{}]+', '', entry['value'])
-        elif entry['type'] == 'text':
-            value = '{}'.format(entry['value'])
         else:
             value = entry['value']
 
-        # Handle string modifiers
+        modifiers = entry.get('modifiers', list())
         if modifiers:
             value += '<MODIFIED>{}'.format(' & '.join(sorted(modifiers)))
 
-        if name == '$':
-            # Track anonymous strings
+        if entry['name'] == '$':
             string_mapping['anonymous'].append(value)
         else:
-            # Track named strings
-            string_mapping['named'][name] = value
+            string_mapping['named'][entry['name']] = value
 
-        # Track all string values
-        string_values.append(value)
+    return string_mapping
 
-    # Sort all string values
-    string_values.sort()
+
+def _legacy_condition_mapping(rule, string_mapping):
+    condition_string_prefaces = ('$', '!', '#', '@')
+    conditions = rule['condition_terms']
+    condition_mapping = list()
+    string_values = sorted(string_mapping['anonymous'] + list(string_mapping['named'].values()))
 
     for cond in conditions:
-        # All string references (sort for consistency)
         if cond == 'them' or cond == '$*':
             all_values = '<STRINGVALUE>{}'.format(' | '.join(string_values))
             if cond == 'them':
                 condition_mapping.extend(['(', all_values, ')'])
             else:
                 condition_mapping.append(all_values)
-
         elif cond in ['#', '@', '!', '$']:
             condition_mapping.append(cond)
-
         elif cond.startswith('$') and cond != '$':
-            # Exact Match
             if cond in string_mapping['named']:
                 condition_mapping.append('<STRINGVALUE>{}'.format(string_mapping['named'][cond]))
-            # Wildcard Match
             elif '*' in cond:
                 wildcard_strings = list()
-                cond = cond.replace('$', r'\$').replace('*', '.*')
-                pattern = re.compile(cond)
+                wildcard_pattern = re.compile(cond.replace('$', r'\$').replace('*', '.*'))
 
                 for name, value in string_mapping['named'].items():
-                    if pattern.match(name):
+                    if wildcard_pattern.match(name):
                         wildcard_strings.append(value)
 
                 wildcard_strings.sort()
                 condition_mapping.append('<STRINGVALUE>{}'.format(' | '.join(wildcard_strings)))
             else:
-                condstr = ' '.join(conditions)
-                logger.error(f'Unhandled String Condition "{cond}" in "{condstr}"')
-
-        # Count Match
+                logger.error(f'Unhandled String Condition "{cond}" in "{" ".join(conditions)}"')
         elif cond[:1] in condition_string_prefaces and cond not in ('#', '!='):
             symbol = cond[:1]
-            cond = '${}'.format(cond[1:])
-            if symbol == '#':
-                symbol_type = 'COUNTOFSTRING'
-            elif symbol == '@':
-                symbol_type = 'POSITIONOFSTRING'
-            elif symbol == '!':
-                symbol_type = 'LENGTHOFSTRING'
-            elif symbol == cond == '$':
-                symbol_type = 'ANONYMOUSSTRING'
-            else:
-                symbol_type = 'UNKNOWN'
+            named_cond = '${}'.format(cond[1:])
+            symbol_type = _REFERENCE_TYPES.get(symbol, 'UNKNOWN')
 
-            if cond in string_mapping['named']:
-                condition_mapping.append('<{}>{}'.format(symbol_type, string_mapping['named'][cond]))
+            if named_cond in string_mapping['named']:
+                condition_mapping.append('<{}>{}'.format(symbol_type, string_mapping['named'][named_cond]))
             else:
-                condition_mapping.append('<{}>{}'.format(symbol_type, cond))
-                condstr = ' '.join(conditions)
-                logger.error(f'Unhandled {symbol_type} Condition "{symbol}" in "{condstr}"')
-
+                condition_mapping.append('<{}>{}'.format(symbol_type, named_cond))
+                logger.error(f'Unhandled {symbol_type} Condition "{symbol}" in "{" ".join(conditions)}"')
         else:
             condition_mapping.append(cond)
-    hf.update(''.join(condition_mapping).encode())
 
+    return condition_mapping
+
+
+def generate_hash(rule, legacy=False, version=_HASH_VERSION):
+    """Calculate a secure hash of the matching logic in rule strings and condition.
+
+    The hash excludes comments, metadata, tags, scopes, rule names, and unused strings that cannot affect the
+    condition. String declaration order, modifier declaration order, and the members of an ``of`` set are
+    canonicalized because those changes do not alter matching logic.
+
+    Args:
+        rule: Dict output from a parsed rule.
+        legacy: Enables the original unprefixed hash output.
+        version: Selects the versioned canonicalization rules.
+
+    Returns:
+        str: hexdigest
+    """
     if legacy:
-        hexdigest = hf.hexdigest()
-    else:
-        hexdigest = f'{version}_{algo}_{hf.hexdigest()}'
+        string_mapping = _legacy_string_mapping(rule)
+        condition_mapping = _legacy_condition_mapping(rule, string_mapping)
+        return _hash_condition(condition_mapping)
 
-    return hexdigest
+    if version not in (_LEGACY_HASH_VERSION, _HASH_VERSION):
+        raise ValueError('Unsupported logic hash version: {}'.format(version))
+
+    if version == _LEGACY_HASH_VERSION:
+        string_mapping = _legacy_string_mapping(rule)
+        condition_mapping = _legacy_condition_mapping(rule, string_mapping)
+    else:
+        string_mapping = _build_string_mapping(rule)
+        condition_mapping = _canonical_condition_terms(rule, string_mapping)
+
+    return _hash_condition(condition_mapping, version)
+
+
+def migrate_hash(old_hash, rule=None):
+    """Migrate a stored logic hash when a current rule proves its disposition remains valid.
+
+    A hash cannot be reversed, so a current parsed rule is required. If that rule reproduces the stored v1
+    fingerprint, its v2 fingerprint is returned. Otherwise the record remains assigned to the caller's review
+    queue rather than inheriting the old false-positive disposition.
+
+    Args:
+        old_hash: Previously stored logic hash, with or without the v1 prefix.
+        rule: Dict output from parsing the current rule.
+
+    Returns:
+        dict: Migration status and, when equivalence is proven, the replacement hash.
+    """
+    result = {'old_hash': old_hash, 'status': 'pending_review'}
+
+    if rule is None:
+        result['reason'] = 'current rule required to prove equivalence'
+        return result
+
+    new_hash = generate_hash(rule)
+
+    if old_hash == new_hash:
+        result['status'] = 'current'
+        result['new_hash'] = new_hash
+        return result
+
+    legacy_hash = generate_hash(rule, legacy=True)
+    v1_hash = generate_hash(rule, version=_LEGACY_HASH_VERSION)
+
+    if old_hash == legacy_hash or old_hash == v1_hash:
+        result['status'] = 'migrated'
+        result['new_hash'] = new_hash
+    else:
+        result['reason'] = 'current rule does not reproduce the stored v1 fingerprint'
+
+    return result
 
 
 def rebuild_yara_rule(rule, condition_indents=False):

@@ -171,11 +171,42 @@ When reusing a `parser` for multiple rules and/or files and `import_effects` is 
 
 ## Breaking Change: Logic Hash Versions
 
-Logic hashes now prepend a version number as well as the algorithm used to the hash itself. This will make future changes and revisions easier for uses to track. The old behavior is accessed using the `legacy` parameter on the `utils.generate_hash()` utility function.
+Logic hashes prepend a version number and the algorithm used to the hash itself. The default output is now v2. Use `legacy=True` for the original unprefixed digest, or `version='v1'` for the original v1-prefixed digest.
 
 ```python
 rules = Plyara().parse_string(input_string)
-rulehash = generate_hash(rules[0], legacy=True)
+rulehash = generate_hash(rules[0])
+legacy_rulehash = generate_hash(rules[0], legacy=True)
+v1_rulehash = generate_hash(rules[0], version='v1')
+```
+
+### Logic Hash Boundaries
+
+A logic hash covers only the string definitions and condition terms that can affect whether YARA matches. It excludes rule names, metadata, tags, scopes, comments, imports that are not used by the condition, and strings that are not reachable from the condition.
+
+The v2 canonical form keeps the same fingerprint for these matching-equivalent edits:
+
+- Comment changes anywhere in the rule.
+- Renaming a string identifier and updating its `$`, `#`, `@`, or `!` references.
+- Renaming identifiers used by a wildcard such as `$foo*`, `#foo*`, `@foo*`, or `!foo*`.
+- Reordering the members of an `of` set, including `them`, `$*`, and parenthesized wildcard sets.
+- Reordering string declarations or the modifiers on one string.
+
+A new v2 fingerprint is required when the matching logic changes. This includes string values, string modifiers, condition operators or operands, quantifiers such as `any` versus `all`, byte-pattern negation, groups, alternatives, jumps, or the set of strings selected by a wildcard. General reordering of condition operands is not canonicalized because the flattened condition representation cannot prove that parentheses and operator precedence remain equivalent.
+
+The v2 representation also includes the string type and preserves byte-pattern syntax such as `~`, `(`, `)`, and `|`. This prevents v1 collisions between different string types or between patterns such as `{ 01 ~02 }` and `{ 01 02 }`.
+
+### Migrating Stored v1 Dispositions
+
+A hash cannot be reversed, so an old record can be reused only when the current parsed rule reproduces its stored v1 hash. `migrate_hash()` returns `migrated` with a v2 hash in that case. If no rule is available, or the current rule does not reproduce the old fingerprint, it returns `pending_review` so the false-positive disposition is not inherited without proof.
+
+```python
+result = migrate_hash(stored_hash, current_parsed_rule)
+
+if result['status'] == 'migrated':
+    replacement_hash = result['new_hash']
+else:
+    queue_for_manual_review(result)
 ```
 
 ## Pre-Processing

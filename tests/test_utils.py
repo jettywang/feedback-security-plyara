@@ -18,6 +18,7 @@ import unittest
 
 import plyara.core
 from plyara.utils import generate_hash
+from plyara.utils import migrate_hash
 from plyara.utils import rebuild_yara_rule
 
 
@@ -63,9 +64,18 @@ class TestUtilities(unittest.TestCase):
             rulehash = generate_hash(result, legacy=True)
             self.assertEqual(rulehash, rule_hashes[index])
 
-    def test_generate_hash_output(self):
+    def test_generate_hash_output_v1(self):
         rule_hashes = self.data.joinpath('rulehashes.txt').read_text().splitlines()
-        # Rules containing "(1..#)" or similar iterators cause Unhandled String Count Condition errors
+        input_string = self.common.joinpath('test_rules_from_yara_project.yar').read_text()
+
+        results = plyara.core.Plyara().parse_string(input_string)
+
+        for index, result in enumerate(results):
+            rulehash = generate_hash(result, version='v1')
+            self.assertEqual(rulehash, rule_hashes[index])
+
+    def test_generate_hash_output_v2(self):
+        rule_hashes = self.data.joinpath('rulehashes_v2.txt').read_text().splitlines()
         input_string = self.common.joinpath('test_rules_from_yara_project.yar').read_text()
 
         results = plyara.core.Plyara().parse_string(input_string)
@@ -73,6 +83,275 @@ class TestUtilities(unittest.TestCase):
         for index, result in enumerate(results):
             rulehash = generate_hash(result)
             self.assertEqual(rulehash, rule_hashes[index])
+
+    def test_generate_hash_equivalence_boundaries(self):
+        ruleset = '''
+rule comments_a {
+    strings:
+        $foo = "abc"
+    condition:
+        $foo
+}
+
+rule comments_b {
+    strings:
+        /* review note */
+        $bar = "abc" // review note
+    condition:
+        /* review note */
+        $bar
+}
+
+rule reference_a {
+    strings:
+        $foo = "abc"
+    condition:
+        #foo == 1 and @foo > 0 and !foo > 0
+}
+
+rule reference_b {
+    strings:
+        $bar = "abc"
+    condition:
+        #bar == 1 and @bar > 0 and !bar > 0
+}
+
+rule wildcard_a {
+    strings:
+        $foo1 = "abc"
+        $foo2 = "def"
+    condition:
+        any of ($foo*) and #foo* == 2 and @foo* > 0 and !foo* > 0
+}
+
+rule wildcard_b {
+    strings:
+        $bar1 = "abc"
+        $bar2 = "def"
+    condition:
+        any of ($bar*) and #bar* == 2 and @bar* > 0 and !bar* > 0
+}
+
+rule wildcard_set_a {
+    strings:
+        $foo1 = "abc"
+        $foo2 = "def"
+    condition:
+        any of $foo*
+}
+
+rule wildcard_set_b {
+    strings:
+        $bar1 = "abc"
+        $bar2 = "def"
+    condition:
+        any of ($bar*)
+}
+
+rule count_wildcard_a {
+    strings:
+        $foo1 = "abc"
+        $foo2 = "def"
+    condition:
+        #* == 2
+}
+
+rule count_wildcard_b {
+    strings:
+        $bar1 = "abc"
+        $bar2 = "def"
+    condition:
+        #* == 2
+}
+
+rule set_a {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        any of ($a, $b)
+}
+
+rule set_b {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        any of ($b, $a)
+}
+
+rule allset_a {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        all of them
+}
+
+rule allset_b {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        all of ($*)
+}
+
+rule modifier_a {
+    strings:
+        $a = "abc" nocase
+    condition:
+        $a
+}
+
+rule modifier_order_a {
+    strings:
+        $a = "abc" wide ascii
+    condition:
+        $a
+}
+
+rule modifier_order_b {
+    strings:
+        $b = "abc" ascii wide
+    condition:
+        $b
+}
+
+rule modifier_b {
+    strings:
+        $b = "abc"
+    condition:
+        $b
+}
+
+rule order_a {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        $a and $b
+}
+
+rule order_b {
+    strings:
+        $b = "def"
+        $a = "abc"
+    condition:
+        $a and $b
+}
+
+rule condition_order_a {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        $a and $b
+}
+
+rule condition_order_b {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        $b and $a
+}
+
+rule logic_a {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        any of ($a, $b)
+}
+
+rule logic_b {
+    strings:
+        $a = "abc"
+        $b = "def"
+    condition:
+        all of ($a, $b)
+}
+
+rule byte_a {
+    strings:
+        $a = { 01 ~02 }
+    condition:
+        $a
+}
+
+rule byte_b {
+    strings:
+        $a = { 01 02 }
+    condition:
+        $a
+}
+'''
+        rules = {entry['rule_name']: entry for entry in plyara.core.Plyara().parse_string(ruleset)}
+        equivalent_pairs = [
+            ('comments_a', 'comments_b'),
+            ('reference_a', 'reference_b'),
+            ('wildcard_a', 'wildcard_b'),
+            ('wildcard_set_a', 'wildcard_set_b'),
+            ('count_wildcard_a', 'count_wildcard_b'),
+            ('set_a', 'set_b'),
+            ('allset_a', 'allset_b'),
+            ('modifier_order_a', 'modifier_order_b'),
+            ('order_a', 'order_b'),
+        ]
+        changed_pairs = [
+            ('modifier_a', 'modifier_b'),
+            ('condition_order_a', 'condition_order_b'),
+            ('logic_a', 'logic_b'),
+            ('byte_a', 'byte_b'),
+        ]
+
+        for first, second in equivalent_pairs:
+            self.assertEqual(
+                generate_hash(rules[first]),
+                generate_hash(rules[second]),
+                'expected equivalent fingerprints for {} and {}'.format(first, second)
+            )
+
+        for first, second in changed_pairs:
+            self.assertNotEqual(
+                generate_hash(rules[first]),
+                generate_hash(rules[second]),
+                'expected distinct fingerprints for {} and {}'.format(first, second)
+            )
+
+    def test_generate_hash_rejects_unknown_version(self):
+        rule = plyara.core.Plyara().parse_string('rule x { condition: true }')[0]
+
+        with self.assertRaises(ValueError):
+            generate_hash(rule, version='v3')
+
+    def test_migrate_hash(self):
+        rule = plyara.core.Plyara().parse_string('rule x { strings: $a = "abc" condition: $a }')[0]
+        old_hash = generate_hash(rule, version='v1')
+        current_hash = generate_hash(rule)
+
+        migrated = migrate_hash(old_hash, rule)
+        self.assertEqual('migrated', migrated['status'])
+        self.assertEqual(current_hash, migrated['new_hash'])
+
+        current = migrate_hash(current_hash, rule)
+        self.assertEqual('current', current['status'])
+        self.assertEqual(current_hash, current['new_hash'])
+
+        legacy_migrated = migrate_hash(generate_hash(rule, legacy=True), rule)
+        self.assertEqual('migrated', legacy_migrated['status'])
+        self.assertEqual(current_hash, legacy_migrated['new_hash'])
+
+        changed_rule = plyara.core.Plyara().parse_string(
+            'rule x { strings: $a = "def" condition: $a }'
+        )[0]
+        review = migrate_hash(old_hash, changed_rule)
+        self.assertEqual('pending_review', review['status'])
+        self.assertNotIn('new_hash', review)
+
+        missing_rule = migrate_hash(old_hash)
+        self.assertEqual('pending_review', missing_rule['status'])
+        self.assertNotIn('new_hash', missing_rule)
 
     def test_rebuild_yara_rule(self):
         input_string = self.data.joinpath('rebuild_ruleset.yar').read_text(encoding='utf-8')
